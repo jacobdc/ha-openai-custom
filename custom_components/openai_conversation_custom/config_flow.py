@@ -120,18 +120,32 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> None:
     if data.get(CONF_BASE_URL):
         client_kwargs["base_url"] = data[CONF_BASE_URL]
     client = openai.AsyncOpenAI(**client_kwargs)
-    try:
-        await client.models.list(timeout=10.0)
-    except openai.NotFoundError:
-        _LOGGER.warning("Endpoint does not support models.list, skipping validation")
-    except openai.APIStatusError as err:
-        if err.status_code in (404, 405, 501):
-            _LOGGER.warning(
-                "Endpoint does not support models.list (status %s), skipping validation",
-                err.status_code,
+    if data.get(CONF_BASE_URL):
+        # Custom endpoint — just verify chat completions works
+        try:
+            response = await client.chat.completions.create(
+                model="sonnet",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+                timeout=10.0,
             )
-        else:
+        except openai.AuthenticationError:
             raise
+        except Exception:
+            _LOGGER.warning("Custom endpoint validation via chat.completions failed, but continuing setup")
+    else:
+        try:
+            await client.models.list(timeout=10.0)
+        except openai.NotFoundError:
+            _LOGGER.warning("Endpoint does not support models.list, skipping validation")
+        except openai.APIStatusError as err:
+            if err.status_code in (404, 405, 501):
+                _LOGGER.warning(
+                    "Endpoint does not support models.list (status %s), skipping validation",
+                    err.status_code,
+                )
+            else:
+                raise
 
 
 class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
