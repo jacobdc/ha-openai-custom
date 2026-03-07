@@ -1,86 +1,228 @@
-"""Conversation support for OpenAI."""
+"""Conversation agent for OpenClaw — streaming-first."""
+from __future__ import annotations
 
-from typing import Literal
+import asyncio
+import json
+import logging
+from collections.abc import AsyncGenerator
+from typing import Any, Literal
+
+import aiohttp
 
 from homeassistant.components import conversation
-from homeassistant.config_entries import ConfigSubentry
-from homeassistant.const import CONF_LLM_HASS_API, MATCH_ALL
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.const import MATCH_ALL
 
-from . import OpenAIConfigEntry
-from .const import CONF_PROMPT, DOMAIN
-from .entity import OpenAIBaseLLMEntity
+from .const import (
+    CONF_API_KEY,
+    CONF_BASE_URL,
+    CONF_MODEL,
+    CONF_PROMPT,
+    CONF_TIMEOUT,
+    DEFAULT_MODEL,
+    DEFAULT_TIMEOUT,
+    DOMAIN,
+    LOGGER,
+)
 
-# Max number of back and forth with the LLM to generate a response
+_LOGGER = logging.getLogger(__name__)
+
+MAX_HISTORY = 20  # messages to keep per conversation
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: OpenAIConfigEntry,
+    config_entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up conversation entities."""
-    for subentry in config_entry.subentries.values():
-        if subentry.subentry_type != "conversation":
-            continue
-
-        async_add_entities(
-            [OpenAIConversationEntity(config_entry, subentry)],
-            config_subentry_id=subentry.subentry_id,
-        )
+    async_add_entities([OpenClawConversationEntity(hass, config_entry)])
 
 
-class OpenAIConversationEntity(
+class OpenClawConversationEntity(
     conversation.ConversationEntity,
     conversation.AbstractConversationAgent,
-    OpenAIBaseLLMEntity,
 ):
-    """OpenAI conversation agent."""
+    """OpenClaw conversation agent with streaming support."""
 
+    _attr_has_entity_name = True
+    _attr_name = None
     _attr_supports_streaming = True
+    _attr_supported_features = conversation.ConversationEntityFeature.CONTROL
 
-    def __init__(self, entry: OpenAIConfigEntry, subentry: ConfigSubentry) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the agent."""
-        super().__init__(entry, subentry)
-        if self.subentry.data.get(CONF_LLM_HASS_API):
-            self._attr_supported_features = (
-                conversation.ConversationEntityFeature.CONTROL
-            )
+        self.hass = hass
+        self.entry = entry
+        self._attr_unique_id = entry.entry_id
+        self._conversations: dict[str, list[dict[str, Any]]] = {}
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
-        """Return a list of supported languages."""
+        """Return supported languages."""
         return MATCH_ALL
 
     async def async_added_to_hass(self) -> None:
-        """When entity is added to Home Assistant."""
+        """Register as conversation agent."""
         await super().async_added_to_hass()
         conversation.async_set_agent(self.hass, self.entry, self)
 
     async def async_will_remove_from_hass(self) -> None:
-        """When entity will be removed from Home Assistant."""
+        """Unregister as conversation agent."""
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
+
+    def _get_client_params(self) -> tuple[str, str, str, int]:
+        """Return (base_url, api_key, model, timeout)."""
+        data = self.entry.data
+        base_url = data[CONF_BASE_URL].rstrip("/")
+        api_key = data[CONF_API_KEY]
+        model = data.get(CONF_MODEL, DEFAULT_MODEL)
+        timeout = int(data.get(CONF_TIMEOUT, DEFAULT_TIMEOUT))
+        return base_url, api_key, model, timeout
+
+    def _build_messages(
+        self,
+        history: list[dict[str, Any]],
+        chat_log: conversation.ChatLog,
+    ) -> list[dict[str, Any]]:
+        """Build the message list from HA chat log + history."""
+        # Get system prompt from config + HA context
+        system_prompt = self.entry.data.get(CONF_PROMPT, "")
+
+        # Build from HA chat log content
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        # Add conversation history
+        messages.extend(history)
+
+        # Add any remaining content from the chat_log that isn't in history
+        # The last user message comes from user_input directly
+        for content in chat_log.content:
+            if content.role == "user" and content.content:
+                # Already in history or is the new message — we'll add from user_input
+                pass
+
+        return messages
 
     async def _async_handle_message(
         self,
         user_input: conversation.ConversationInput,
         chat_log: conversation.ChatLog,
     ) -> conversation.ConversationResult:
-        """Process the user input and call the API."""
-        options = self.subentry.data
+        """Handle a message — streaming path."""
+        conversation_id = user_input.conversation_id or user_input.device_id or "default"
+
+        # Get or init history
+        history = self._conversations.get(conversation_id, [])
+
+        # Add system prompt if first message and configured
+        system_prompt = self.entry.data.get(CONF_PROMPT, "")
+        messages: list[dict[str, Any]] = []
+        if system_prompt and not history:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_input.text})
+
+        base_url, api_key, model, timeout = self._get_client_params()
+        session = async_get_clientsession(self.hass)
 
         try:
             await chat_log.async_provide_llm_data(
                 user_input.as_llm_context(DOMAIN),
-                options.get(CONF_LLM_HASS_API),
-                options.get(CONF_PROMPT),
+                None,
+                system_prompt or None,
                 user_input.extra_system_prompt,
             )
         except conversation.ConverseError as err:
             return err.as_conversation_result()
 
-        await self._async_handle_chat_log(chat_log)
+        full_response_parts: list[str] = []
+
+        try:
+            async for content in chat_log.async_add_delta_content_stream(
+                self.entity_id,
+                self._stream_response(
+                    session, base_url, api_key, model, timeout, messages
+                ),
+            ):
+                if isinstance(content, conversation.AssistantContent) and content.content:
+                    full_response_parts.append(content.content)
+        except HomeAssistantError:
+            raise
+        except Exception as err:
+            _LOGGER.error("Error calling OpenClaw: %s", err)
+            raise HomeAssistantError(f"Error talking to OpenClaw: {err}") from err
+
+        # Update history
+        full_response = "".join(full_response_parts)
+        history.append({"role": "user", "content": user_input.text})
+        history.append({"role": "assistant", "content": full_response})
+        self._conversations[conversation_id] = history[-MAX_HISTORY:]
 
         return conversation.async_get_result_from_chat_log(user_input, chat_log)
+
+    async def _stream_response(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: int,
+        messages: list[dict[str, Any]],
+    ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
+        """Call OpenClaw with stream=true and yield HA delta dicts."""
+        http_timeout = aiohttp.ClientTimeout(total=timeout)
+        started = False
+
+        async with session.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": True,
+            },
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "text/event-stream",
+            },
+            timeout=http_timeout,
+        ) as resp:
+            if resp.status == 401:
+                raise HomeAssistantError("Invalid OpenClaw API token")
+            if resp.status >= 400:
+                body = await resp.text()
+                raise HomeAssistantError(f"OpenClaw error {resp.status}: {body[:200]}")
+
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+
+                delta = choices[0].get("delta", {})
+                content = delta.get("content")
+                if content:
+                    if not started:
+                        yield {"role": "assistant"}
+                        started = True
+                    yield {"content": content}
+
+        if not started:
+            yield {"role": "assistant"}

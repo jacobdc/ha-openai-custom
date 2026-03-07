@@ -1,13 +1,11 @@
 {
   "domain": "openai_conversation_custom",
-  "name": "OpenAI Custom",
-  "after_dependencies": ["assist_pipeline", "intent"],
+  "name": "OpenAI Conversation Custom",
+  "version": "2.0.0",
+  "documentation": "https://github.com/jacobdc/ha-openai-custom",
+  "requirements": [],
+  "dependencies": [],
   "codeowners": [],
-  "config_flow": true,
-  "dependencies": ["conversation"],
-  "documentation": "https://www.home-assistant.io/integrations/openai_conversation",
-  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "requirements": ["openai==2.21.0"],
-  "version": "1.0.0"
+  "config_flow": true
 }
