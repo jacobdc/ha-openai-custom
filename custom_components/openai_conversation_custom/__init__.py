@@ -289,22 +289,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenAIConfigEntry) -> bo
     # Cache current platform data which gets added to each request (caching done by library)
     _ = await hass.async_add_executor_job(client.platform_headers)
 
-    try:
-        await hass.async_add_executor_job(client.with_options(timeout=10.0).models.list)
-    except openai.AuthenticationError as err:
-        raise ConfigEntryAuthFailed(err) from err
-    except openai.NotFoundError:
-        LOGGER.warning("Endpoint does not support models.list, skipping validation")
-    except openai.APIStatusError as err:
-        if err.status_code in (404, 405, 501):
-            LOGGER.warning(
-                "Endpoint does not support models.list (status %s), skipping",
-                err.status_code,
-            )
-        else:
+    if not entry.data.get(CONF_BASE_URL):
+        try:
+            await hass.async_add_executor_job(client.with_options(timeout=10.0).models.list)
+        except openai.AuthenticationError as err:
+            raise ConfigEntryAuthFailed(err) from err
+        except openai.NotFoundError:
+            LOGGER.warning("Endpoint does not support models.list, skipping validation")
+        except openai.APIStatusError as err:
+            if err.status_code in (404, 405, 501):
+                LOGGER.warning(
+                    "Endpoint does not support models.list (status %s), skipping",
+                    err.status_code,
+                )
+            else:
+                raise ConfigEntryNotReady(err) from err
+        except openai.OpenAIError as err:
             raise ConfigEntryNotReady(err) from err
-    except openai.OpenAIError as err:
-        raise ConfigEntryNotReady(err) from err
+    else:
+        LOGGER.info("Custom base_url configured, skipping models.list validation")
 
     entry.runtime_data = client
 
