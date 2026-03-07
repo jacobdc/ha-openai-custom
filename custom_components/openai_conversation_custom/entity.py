@@ -7,54 +7,11 @@ from collections.abc import AsyncGenerator, Callable, Iterable
 import json
 from mimetypes import guess_file_type
 from pathlib import Path
-import re
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any
 
 import openai
 from openai._streaming import AsyncStream
-from openai.types.responses import (
-    EasyInputMessageParam,
-    FunctionToolParam,
-    ResponseCodeInterpreterToolCall,
-    ResponseCompletedEvent,
-    ResponseErrorEvent,
-    ResponseFailedEvent,
-    ResponseFunctionCallArgumentsDeltaEvent,
-    ResponseFunctionCallArgumentsDoneEvent,
-    ResponseFunctionToolCall,
-    ResponseFunctionToolCallParam,
-    ResponseFunctionWebSearch,
-    ResponseFunctionWebSearchParam,
-    ResponseIncompleteEvent,
-    ResponseInputFileParam,
-    ResponseInputImageParam,
-    ResponseInputMessageContentListParam,
-    ResponseInputParam,
-    ResponseInputTextParam,
-    ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent,
-    ResponseOutputMessage,
-    ResponseReasoningItem,
-    ResponseReasoningItemParam,
-    ResponseReasoningSummaryTextDeltaEvent,
-    ResponseStreamEvent,
-    ResponseTextDeltaEvent,
-    ToolChoiceTypesParam,
-    ToolParam,
-    WebSearchToolParam,
-)
-from openai.types.responses.response_create_params import ResponseCreateParamsStreaming
-from openai.types.responses.response_input_param import (
-    FunctionCallOutput,
-    ImageGenerationCall as ImageGenerationCallParam,
-)
-from openai.types.responses.response_output_item import ImageGenerationCall
-from openai.types.responses.tool_param import (
-    CodeInterpreter,
-    CodeInterpreterContainerCodeInterpreterToolAuto,
-    ImageGeneration,
-)
-from openai.types.responses.web_search_tool_param import UserLocation
+from openai.types.chat import ChatCompletionChunk
 import voluptuous as vol
 from voluptuous_openapi import convert
 
@@ -69,36 +26,16 @@ from homeassistant.util import slugify
 
 from .const import (
     CONF_CHAT_MODEL,
-    CONF_CODE_INTERPRETER,
-    CONF_IMAGE_MODEL,
     CONF_MAX_TOKENS,
-    CONF_REASONING_EFFORT,
-    CONF_REASONING_SUMMARY,
     CONF_TEMPERATURE,
     CONF_TOP_P,
-    CONF_VERBOSITY,
-    CONF_WEB_SEARCH,
-    CONF_WEB_SEARCH_CITY,
-    CONF_WEB_SEARCH_CONTEXT_SIZE,
-    CONF_WEB_SEARCH_COUNTRY,
-    CONF_WEB_SEARCH_INLINE_CITATIONS,
-    CONF_WEB_SEARCH_REGION,
-    CONF_WEB_SEARCH_TIMEZONE,
-    CONF_WEB_SEARCH_USER_LOCATION,
     DOMAIN,
     LOGGER,
     RECOMMENDED_CHAT_MODEL,
-    RECOMMENDED_IMAGE_MODEL,
     RECOMMENDED_MAX_TOKENS,
-    RECOMMENDED_REASONING_EFFORT,
-    RECOMMENDED_REASONING_SUMMARY,
     RECOMMENDED_STT_MODEL,
     RECOMMENDED_TEMPERATURE,
     RECOMMENDED_TOP_P,
-    RECOMMENDED_VERBOSITY,
-    RECOMMENDED_WEB_SEARCH_CONTEXT_SIZE,
-    RECOMMENDED_WEB_SEARCH_INLINE_CITATIONS,
-    UNSUPPORTED_EXTENDED_CACHE_RETENTION_MODELS,
 )
 
 if TYPE_CHECKING:
@@ -152,309 +89,145 @@ def _format_structured_output(
 
 def _format_tool(
     tool: llm.Tool, custom_serializer: Callable[[Any], Any] | None
-) -> FunctionToolParam:
-    """Format tool specification."""
-    return FunctionToolParam(
-        type="function",
-        name=tool.name,
-        parameters=convert(tool.parameters, custom_serializer=custom_serializer),
-        description=tool.description,
-        strict=False,
-    )
+) -> dict[str, Any]:
+    """Format tool specification for Chat Completions API."""
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": convert(tool.parameters, custom_serializer=custom_serializer),
+        },
+    }
 
 
 def _convert_content_to_param(
     chat_content: Iterable[conversation.Content],
-) -> ResponseInputParam:
-    """Convert any native chat message for this agent to the native format."""
-    messages: ResponseInputParam = []
-    reasoning_summary: list[str] = []
-    web_search_calls: dict[str, ResponseFunctionWebSearchParam] = {}
+) -> list[dict[str, Any]]:
+    """Convert HA chat content to Chat Completions message format."""
+    messages: list[dict[str, Any]] = []
 
     for content in chat_content:
         if isinstance(content, conversation.ToolResultContent):
-            if (
-                content.tool_name == "web_search_call"
-                and content.tool_call_id in web_search_calls
-            ):
-                web_search_call = web_search_calls.pop(content.tool_call_id)
-                web_search_call["status"] = content.tool_result.get(  # type: ignore[typeddict-item]
-                    "status", "completed"
-                )
-                messages.append(web_search_call)
-            else:
-                messages.append(
-                    FunctionCallOutput(
-                        type="function_call_output",
-                        call_id=content.tool_call_id,
-                        output=json_dumps(content.tool_result),
-                    )
-                )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": content.tool_call_id,
+                    "content": json_dumps(content.tool_result),
+                }
+            )
             continue
 
-        if content.content:
-            role: Literal["user", "assistant", "system", "developer"] = content.role
-            if role == "system":
-                role = "developer"
-            messages.append(
-                EasyInputMessageParam(
-                    type="message", role=role, content=content.content
-                )
-            )
-
         if isinstance(content, conversation.AssistantContent):
+            msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": content.content or None,
+            }
             if content.tool_calls:
-                for tool_call in content.tool_calls:
-                    if (
-                        tool_call.external
-                        and tool_call.tool_name == "web_search_call"
-                        and "action" in tool_call.tool_args
-                    ):
-                        web_search_calls[tool_call.id] = ResponseFunctionWebSearchParam(
-                            type="web_search_call",
-                            id=tool_call.id,
-                            action=tool_call.tool_args["action"],
-                            status="completed",
-                        )
-                    else:
-                        messages.append(
-                            ResponseFunctionToolCallParam(
-                                type="function_call",
-                                name=tool_call.tool_name,
-                                arguments=json_dumps(tool_call.tool_args),
-                                call_id=tool_call.id,
-                            )
-                        )
-
-            if content.thinking_content:
-                reasoning_summary.append(content.thinking_content)
-
-            if isinstance(content.native, ResponseReasoningItem):
-                messages.append(
-                    ResponseReasoningItemParam(
-                        type="reasoning",
-                        id=content.native.id,
-                        summary=(
-                            [
-                                {
-                                    "type": "summary_text",
-                                    "text": summary,
-                                }
-                                for summary in reasoning_summary
-                            ]
-                            if content.thinking_content
-                            else []
-                        ),
-                        encrypted_content=content.native.encrypted_content,
-                    )
-                )
-                reasoning_summary = []
-            elif isinstance(content.native, ImageGenerationCall):
-                messages.append(
-                    cast(ImageGenerationCallParam, content.native.to_dict())
-                )
+                tool_calls_list = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.tool_name,
+                            "arguments": json_dumps(tc.tool_args),
+                        },
+                    }
+                    for tc in content.tool_calls
+                    if not tc.external
+                ]
+                if tool_calls_list:
+                    msg["tool_calls"] = tool_calls_list
+            if msg.get("content") is not None or "tool_calls" in msg:
+                messages.append(msg)
+        elif content.content:
+            messages.append(
+                {
+                    "role": content.role,
+                    "content": content.content,
+                }
+            )
 
     return messages
 
 
-async def _transform_stream(  # noqa: C901 - This is complex, but better to have it in one place
+async def _transform_stream(
     chat_log: conversation.ChatLog,
-    stream: AsyncStream[ResponseStreamEvent],
-    remove_citations: bool = False,
+    result_stream: AsyncStream[ChatCompletionChunk],
 ) -> AsyncGenerator[
     conversation.AssistantContentDeltaDict | conversation.ToolResultContentDeltaDict
 ]:
-    """Transform an OpenAI delta stream into HA format."""
-    last_summary_index = None
-    last_role: Literal["assistant", "tool_result"] | None = None
+    """Transform a Chat Completions delta stream into HA format."""
+    current_tool_calls: dict[int, dict[str, Any]] = {}
+    started = False
 
-    # Non-reasoning models don't follow our request to remove citations, so we remove
-    # them manually here. They always follow the same pattern: the citation is always
-    # in parentheses in Markdown format, the citation is always in a single delta event,
-    # and sometimes the closing parenthesis is split into a separate delta event.
-    remove_parentheses: bool = False
-    citation_regexp = re.compile(r"\(\[([^\]]+)\]\((https?:\/\/[^\)]+)\)")
+    async for chunk in result_stream:
+        LOGGER.debug("Received chunk: %s", chunk)
 
-    async for event in stream:
-        LOGGER.debug("Received event: %s", event)
+        if not chunk.choices:
+            # Usage-only chunk at the end (when stream_options.include_usage is set)
+            if chunk.usage:
+                chat_log.async_trace(
+                    {
+                        "stats": {
+                            "input_tokens": chunk.usage.prompt_tokens,
+                            "output_tokens": chunk.usage.completion_tokens,
+                        }
+                    }
+                )
+            continue
 
-        if isinstance(event, ResponseOutputItemAddedEvent):
-            if isinstance(event.item, ResponseFunctionToolCall):
-                # OpenAI has tool calls as individual events
-                # while HA puts tool calls inside the assistant message.
-                # We turn them into individual assistant content for HA
-                # to ensure that tools are called as soon as possible.
+        choice = chunk.choices[0]
+        delta = choice.delta
+
+        if delta.content:
+            if not started:
                 yield {"role": "assistant"}
-                last_role = "assistant"
-                last_summary_index = None
-                current_tool_call = event.item
-            elif (
-                isinstance(event.item, ResponseOutputMessage)
-                or (
-                    isinstance(event.item, ResponseReasoningItem)
-                    and last_summary_index is not None
-                )  # Subsequent ResponseReasoningItem
-                or last_role != "assistant"
-            ):
+                started = True
+            yield {"content": delta.content}
+
+        if delta.tool_calls:
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index
+                if idx not in current_tool_calls:
+                    current_tool_calls[idx] = {
+                        "id": "",
+                        "name": "",
+                        "arguments": "",
+                    }
+                tc = current_tool_calls[idx]
+                if tc_delta.id:
+                    tc["id"] = tc_delta.id
+                if tc_delta.function:
+                    if tc_delta.function.name:
+                        tc["name"] += tc_delta.function.name
+                    if tc_delta.function.arguments:
+                        tc["arguments"] += tc_delta.function.arguments
+
+        if choice.finish_reason is not None and current_tool_calls:
+            # Emit each accumulated tool call as its own assistant content block
+            for tc in current_tool_calls.values():
                 yield {"role": "assistant"}
-                last_role = "assistant"
-                last_summary_index = None
-        elif isinstance(event, ResponseOutputItemDoneEvent):
-            if isinstance(event.item, ResponseReasoningItem):
-                yield {
-                    "native": ResponseReasoningItem(
-                        type="reasoning",
-                        id=event.item.id,
-                        summary=[],  # Remove summaries
-                        encrypted_content=event.item.encrypted_content,
-                    )
-                }
-                last_summary_index = len(event.item.summary) - 1
-            elif isinstance(event.item, ResponseCodeInterpreterToolCall):
                 yield {
                     "tool_calls": [
                         llm.ToolInput(
-                            id=event.item.id,
-                            tool_name="code_interpreter",
-                            tool_args={
-                                "code": event.item.code,
-                                "container": event.item.container_id,
-                            },
-                            external=True,
+                            id=tc["id"],
+                            tool_name=tc["name"],
+                            tool_args=json.loads(tc["arguments"]),
                         )
                     ]
                 }
-                yield {
-                    "role": "tool_result",
-                    "tool_call_id": event.item.id,
-                    "tool_name": "code_interpreter",
-                    "tool_result": {
-                        "output": (
-                            [output.to_dict() for output in event.item.outputs]  # type: ignore[misc]
-                            if event.item.outputs is not None
-                            else None
-                        )
-                    },
-                }
-                last_role = "tool_result"
-            elif isinstance(event.item, ResponseFunctionWebSearch):
-                yield {
-                    "tool_calls": [
-                        llm.ToolInput(
-                            id=event.item.id,
-                            tool_name="web_search_call",
-                            tool_args={
-                                "action": event.item.action.to_dict(),
-                            },
-                            external=True,
-                        )
-                    ]
-                }
-                yield {
-                    "role": "tool_result",
-                    "tool_call_id": event.item.id,
-                    "tool_name": "web_search_call",
-                    "tool_result": {"status": event.item.status},
-                }
-                last_role = "tool_result"
-            elif isinstance(event.item, ImageGenerationCall):
-                yield {"native": event.item}
-                last_summary_index = -1  # Trigger new assistant message on next turn
-        elif isinstance(event, ResponseTextDeltaEvent):
-            data = event.delta
-            if remove_parentheses:
-                data = data.removeprefix(")")
-                remove_parentheses = False
-            elif remove_citations and (match := citation_regexp.search(data)):
-                match_start, match_end = match.span()
-                # remove leading space if any
-                if data[match_start - 1 : match_start] == " ":
-                    match_start -= 1
-                # remove closing parenthesis:
-                if data[match_end : match_end + 1] == ")":
-                    match_end += 1
-                else:
-                    remove_parentheses = True
-                data = data[:match_start] + data[match_end:]
-            if data:
-                yield {"content": data}
-        elif isinstance(event, ResponseReasoningSummaryTextDeltaEvent):
-            # OpenAI can output several reasoning summaries
-            # in a single ResponseReasoningItem. We split them as separate
-            # AssistantContent messages. Only last of them will have
-            # the reasoning `native` field set.
-            if (
-                last_summary_index is not None
-                and event.summary_index != last_summary_index
-            ):
-                yield {"role": "assistant"}
-                last_role = "assistant"
-            last_summary_index = event.summary_index
-            yield {"thinking_content": event.delta}
-        elif isinstance(event, ResponseFunctionCallArgumentsDeltaEvent):
-            current_tool_call.arguments += event.delta
-        elif isinstance(event, ResponseFunctionCallArgumentsDoneEvent):
-            current_tool_call.status = "completed"
-            yield {
-                "tool_calls": [
-                    llm.ToolInput(
-                        id=current_tool_call.call_id,
-                        tool_name=current_tool_call.name,
-                        tool_args=json.loads(current_tool_call.arguments),
-                    )
-                ]
-            }
-        elif isinstance(event, ResponseCompletedEvent):
-            if event.response.usage is not None:
-                chat_log.async_trace(
-                    {
-                        "stats": {
-                            "input_tokens": event.response.usage.input_tokens,
-                            "output_tokens": event.response.usage.output_tokens,
-                        }
-                    }
-                )
-        elif isinstance(event, ResponseIncompleteEvent):
-            if event.response.usage is not None:
-                chat_log.async_trace(
-                    {
-                        "stats": {
-                            "input_tokens": event.response.usage.input_tokens,
-                            "output_tokens": event.response.usage.output_tokens,
-                        }
-                    }
-                )
+            current_tool_calls = {}
 
-            if (
-                event.response.incomplete_details
-                and event.response.incomplete_details.reason
-            ):
-                reason: str = event.response.incomplete_details.reason
-            else:
-                reason = "unknown reason"
+        if choice.finish_reason is not None and not started:
+            # Empty response - still need to yield an assistant role
+            yield {"role": "assistant"}
+            started = True
 
-            if reason == "max_output_tokens":
-                reason = "max output tokens reached"
-            elif reason == "content_filter":
-                reason = "content filter triggered"
-
-            raise HomeAssistantError(f"OpenAI response incomplete: {reason}")
-        elif isinstance(event, ResponseFailedEvent):
-            if event.response.usage is not None:
-                chat_log.async_trace(
-                    {
-                        "stats": {
-                            "input_tokens": event.response.usage.input_tokens,
-                            "output_tokens": event.response.usage.output_tokens,
-                        }
-                    }
-                )
-            reason = "unknown reason"
-            if event.response.error is not None:
-                reason = event.response.error.message
-            raise HomeAssistantError(f"OpenAI response failed: {reason}")
-        elif isinstance(event, ResponseErrorEvent):
-            raise HomeAssistantError(f"OpenAI response error: {event.message}")
+        if choice.finish_reason == "length":
+            raise HomeAssistantError(
+                "OpenAI response incomplete: max output tokens reached"
+            )
 
 
 class OpenAIBaseLLMEntity(Entity):
@@ -494,116 +267,23 @@ class OpenAIBaseLLMEntity(Entity):
 
         messages = _convert_content_to_param(chat_log.content)
 
-        model_args = ResponseCreateParamsStreaming(
-            model=options.get(CONF_CHAT_MODEL, RECOMMENDED_CHAT_MODEL),
-            input=messages,
-            max_output_tokens=options.get(CONF_MAX_TOKENS, RECOMMENDED_MAX_TOKENS),
-            user=chat_log.conversation_id,
-            store=False,
-            stream=True,
-        )
+        model_args: dict[str, Any] = {
+            "model": options.get(CONF_CHAT_MODEL, RECOMMENDED_CHAT_MODEL),
+            "messages": messages,
+            "max_tokens": options.get(CONF_MAX_TOKENS, RECOMMENDED_MAX_TOKENS),
+            "top_p": options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
+            "temperature": options.get(CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE),
+            "user": chat_log.conversation_id,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
 
-        if model_args["model"].startswith(("o", "gpt-5")):
-            model_args["reasoning"] = {
-                "effort": options.get(
-                    CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
-                )
-                if not model_args["model"].startswith("gpt-5-pro")
-                else "high",  # GPT-5 pro only supports reasoning.effort: high
-                "summary": options.get(
-                    CONF_REASONING_SUMMARY, RECOMMENDED_REASONING_SUMMARY
-                ),
-            }
-            model_args["include"] = ["reasoning.encrypted_content"]
-
-        if (
-            not model_args["model"].startswith("gpt-5")
-            or model_args["reasoning"]["effort"] == "none"  # type: ignore[index]
-        ):
-            model_args["top_p"] = options.get(CONF_TOP_P, RECOMMENDED_TOP_P)
-            model_args["temperature"] = options.get(
-                CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
-            )
-
-        if model_args["model"].startswith("gpt-5"):
-            model_args["text"] = {
-                "verbosity": options.get(CONF_VERBOSITY, RECOMMENDED_VERBOSITY)
-            }
-
-        if not model_args["model"].startswith(
-            tuple(UNSUPPORTED_EXTENDED_CACHE_RETENTION_MODELS)
-        ):
-            model_args["prompt_cache_retention"] = "24h"
-
-        tools: list[ToolParam] = []
+        tools: list[dict[str, Any]] = []
         if chat_log.llm_api:
             tools = [
                 _format_tool(tool, chat_log.llm_api.custom_serializer)
                 for tool in chat_log.llm_api.tools
             ]
-
-        remove_citations = False
-        if options.get(CONF_WEB_SEARCH):
-            web_search = WebSearchToolParam(
-                type="web_search",
-                search_context_size=options.get(
-                    CONF_WEB_SEARCH_CONTEXT_SIZE, RECOMMENDED_WEB_SEARCH_CONTEXT_SIZE
-                ),
-            )
-            if options.get(CONF_WEB_SEARCH_USER_LOCATION):
-                web_search["user_location"] = UserLocation(
-                    type="approximate",
-                    city=options.get(CONF_WEB_SEARCH_CITY, ""),
-                    region=options.get(CONF_WEB_SEARCH_REGION, ""),
-                    country=options.get(CONF_WEB_SEARCH_COUNTRY, ""),
-                    timezone=options.get(CONF_WEB_SEARCH_TIMEZONE, ""),
-                )
-            if not options.get(
-                CONF_WEB_SEARCH_INLINE_CITATIONS,
-                RECOMMENDED_WEB_SEARCH_INLINE_CITATIONS,
-            ):
-                system_message = cast(EasyInputMessageParam, messages[0])
-                content = system_message["content"]
-                if isinstance(content, str):
-                    system_message["content"] = [
-                        ResponseInputTextParam(type="input_text", text=content)
-                    ]
-                system_message["content"].append(  # type: ignore[union-attr]
-                    ResponseInputTextParam(
-                        type="input_text",
-                        text="When doing a web search, do not include source citations",
-                    )
-                )
-
-                if "reasoning" not in model_args:
-                    # Reasoning models handle this correctly with just a prompt
-                    remove_citations = True
-
-            tools.append(web_search)
-
-        if options.get(CONF_CODE_INTERPRETER):
-            tools.append(
-                CodeInterpreter(
-                    type="code_interpreter",
-                    container=CodeInterpreterContainerCodeInterpreterToolAuto(
-                        type="auto"
-                    ),
-                )
-            )
-            model_args.setdefault("include", []).append("code_interpreter_call.outputs")  # type: ignore[union-attr]
-
-        if force_image:
-            image_model = options.get(CONF_IMAGE_MODEL, RECOMMENDED_IMAGE_MODEL)
-            image_tool = ImageGeneration(
-                type="image_generation",
-                model=image_model,
-                output_format="png",
-            )
-            if image_model != "gpt-image-1-mini":
-                image_tool["input_fidelity"] = "high"
-            tools.append(image_tool)
-            model_args["tool_choice"] = ToolChoiceTypesParam(type="image_generation")
-            model_args["store"] = True  # Avoid sending image data back and forth
 
         if tools:
             model_args["tools"] = tools
@@ -618,21 +298,21 @@ class OpenAIBaseLLMEntity(Entity):
             )
             last_message = messages[-1]
             assert (
-                last_message["type"] == "message"
-                and last_message["role"] == "user"
+                last_message["role"] == "user"
                 and isinstance(last_message["content"], str)
             )
             last_message["content"] = [
-                {"type": "input_text", "text": last_message["content"]},  # type: ignore[list-item]
-                *files,  # type: ignore[list-item]
+                {"type": "text", "text": last_message["content"]},
+                *files,
             ]
 
         if structure and structure_name:
-            model_args["text"] = {
-                "format": {
-                    "type": "json_schema",
+            model_args["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
                     "name": slugify(structure_name),
                     "schema": _format_structured_output(structure, chat_log.llm_api),
+                    "strict": True,
                 },
             }
 
@@ -641,7 +321,7 @@ class OpenAIBaseLLMEntity(Entity):
         # To prevent infinite loops, we limit the number of iterations
         for _iteration in range(max_iterations):
             try:
-                stream = await client.responses.create(**model_args)
+                stream = await client.chat.completions.create(**model_args)
 
                 messages.extend(
                     _convert_content_to_param(
@@ -649,7 +329,7 @@ class OpenAIBaseLLMEntity(Entity):
                             content
                             async for content in chat_log.async_add_delta_content_stream(
                                 self.entity_id,
-                                _transform_stream(chat_log, stream, remove_citations),
+                                _transform_stream(chat_log, stream),
                             )
                         ]
                     )
@@ -688,14 +368,14 @@ class OpenAIBaseLLMEntity(Entity):
 
 async def async_prepare_files_for_prompt(
     hass: HomeAssistant, files: list[tuple[Path, str | None]]
-) -> ResponseInputMessageContentListParam:
+) -> list[dict[str, Any]]:
     """Append files to a prompt.
 
     Caller needs to ensure that the files are allowed.
     """
 
-    def append_files_to_content() -> ResponseInputMessageContentListParam:
-        content: ResponseInputMessageContentListParam = []
+    def append_files_to_content() -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = []
 
         for file_path, mime_type in files:
             if not file_path.exists():
@@ -714,19 +394,22 @@ async def async_prepare_files_for_prompt(
 
             if mime_type.startswith("image/"):
                 content.append(
-                    ResponseInputImageParam(
-                        type="input_image",
-                        image_url=f"data:{mime_type};base64,{base64_file}",
-                        detail="auto",
-                    )
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_file}",
+                            "detail": "auto",
+                        },
+                    }
                 )
             elif mime_type.startswith("application/pdf"):
                 content.append(
-                    ResponseInputFileParam(
-                        type="input_file",
-                        filename=str(file_path),
-                        file_data=f"data:{mime_type};base64,{base64_file}",
-                    )
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_file}",
+                        },
+                    }
                 )
 
         return content

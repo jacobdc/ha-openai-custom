@@ -4,16 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import openai
 from openai.types.images_response import ImagesResponse
-from openai.types.responses import (
-    EasyInputMessageParam,
-    Response,
-    ResponseInputMessageContentListParam,
-    ResponseInputParam,
-    ResponseInputTextParam,
-)
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
@@ -46,7 +40,6 @@ from .const import (
     CONF_FILENAMES,
     CONF_MAX_TOKENS,
     CONF_PROMPT,
-    CONF_REASONING_EFFORT,
     CONF_TEMPERATURE,
     CONF_TOP_P,
     DEFAULT_AI_TASK_NAME,
@@ -58,7 +51,6 @@ from .const import (
     RECOMMENDED_AI_TASK_OPTIONS,
     RECOMMENDED_CHAT_MODEL,
     RECOMMENDED_MAX_TOKENS,
-    RECOMMENDED_REASONING_EFFORT,
     RECOMMENDED_STT_OPTIONS,
     RECOMMENDED_TEMPERATURE,
     RECOMMENDED_TOP_P,
@@ -175,8 +167,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         )
         client: openai.AsyncClient = entry.runtime_data
 
-        content: ResponseInputMessageContentListParam = [
-            ResponseInputTextParam(type="input_text", text=call.data[CONF_PROMPT])
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": call.data[CONF_PROMPT]}
         ]
 
         if filenames := call.data.get(CONF_FILENAMES):
@@ -194,14 +186,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 )
             )
 
-        messages: ResponseInputParam = [
-            EasyInputMessageParam(type="message", role="user", content=content)
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": content}
         ]
 
-        model_args = {
+        model_args: dict[str, Any] = {
             "model": model,
-            "input": messages,
-            "max_output_tokens": conversation_subentry.data.get(
+            "messages": messages,
+            "max_tokens": conversation_subentry.data.get(
                 CONF_MAX_TOKENS, RECOMMENDED_MAX_TOKENS
             ),
             "top_p": conversation_subentry.data.get(CONF_TOP_P, RECOMMENDED_TOP_P),
@@ -209,18 +201,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
             ),
             "user": call.context.user_id,
-            "store": False,
         }
 
-        if model.startswith("o"):
-            model_args["reasoning"] = {
-                "effort": conversation_subentry.data.get(
-                    CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
-                )
-            }
-
         try:
-            response: Response = await client.responses.create(**model_args)
+            response = await client.chat.completions.create(**model_args)
         except openai.AuthenticationError as err:
             entry.async_start_reauth(hass)
             raise HomeAssistantError("Authentication error") from err
@@ -229,7 +213,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         except FileNotFoundError as err:
             raise HomeAssistantError(f"Error generating content: {err}") from err
 
-        return {"text": response.output_text}
+        return {"text": response.choices[0].message.content or ""}
 
     hass.services.async_register(
         DOMAIN,
