@@ -9,16 +9,23 @@ from typing import Any
 import aiohttp
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     CONF_API_KEY,
     CONF_BASE_URL,
     CONF_MODEL,
+    CONF_PROMPT,
     CONF_TIMEOUT,
     DEFAULT_MODEL,
     DEFAULT_NAME,
+    DEFAULT_PROMPT,
     DEFAULT_TIMEOUT,
     DOMAIN,
 )
@@ -77,6 +84,13 @@ class OpenAICustomConversationConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> OpenAICustomOptionsFlow:
+        """Get the options flow for this handler."""
+        return OpenAICustomOptionsFlow(config_entry)
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -101,4 +115,45 @@ class OpenAICustomConversationConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=STEP_USER_DATA_SCHEMA,
             errors=errors,
+        )
+
+
+class OpenAICustomOptionsFlow(OptionsFlow):
+    """Handle options for OpenAI Conversation Custom."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Initialize options flow."""
+        self.config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            # Merge options into data so conversation.py reads them
+            new_data = {**self.config_entry.data, **user_input}
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, data=new_data
+            )
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.data
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_PROMPT,
+                        default=current.get(CONF_PROMPT, DEFAULT_PROMPT),
+                    ): str,
+                    vol.Optional(
+                        CONF_MODEL,
+                        default=current.get(CONF_MODEL, DEFAULT_MODEL),
+                    ): str,
+                    vol.Optional(
+                        CONF_TIMEOUT,
+                        default=current.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
+                    ): int,
+                }
+            ),
         )

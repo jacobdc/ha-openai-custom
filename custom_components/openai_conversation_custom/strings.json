@@ -21,5 +21,18 @@
     "abort": {
       "already_configured": "Already configured"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Conversation Agent",
+        "description": "Adjust the system prompt, model, and timeout.",
+        "data": {
+          "prompt": "System prompt",
+          "model": "Model (e.g. sonnet, haiku)",
+          "timeout": "Timeout (seconds)"
+        }
+      }
+    }
   }
 }

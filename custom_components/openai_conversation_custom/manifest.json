@@ -1,7 +1,7 @@
 {
   "domain": "openai_conversation_custom",
   "name": "OpenAI Conversation Custom",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "documentation": "https://github.com/jacobdc/ha-openai-custom",
   "requirements": [],
   "dependencies": [],
