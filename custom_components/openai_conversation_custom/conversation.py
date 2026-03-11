@@ -13,6 +13,7 @@ from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr, entity_registry as er, area_registry as ar
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.const import MATCH_ALL
@@ -85,6 +86,54 @@ class OpenClawConversationEntity(
         timeout = int(data.get(CONF_TIMEOUT, DEFAULT_TIMEOUT))
         return base_url, api_key, model, timeout
 
+    def _resolve_area(self, user_input: conversation.ConversationInput) -> str | None:
+        """Resolve area name from device_id or satellite_id."""
+        area_reg = ar.async_get(self.hass)
+        dev_reg = dr.async_get(self.hass)
+        ent_reg = er.async_get(self.hass)
+
+        # Try satellite_id first (entity_id of the assist satellite)
+        if user_input.satellite_id:
+            entry = ent_reg.async_get(user_input.satellite_id)
+            if entry and entry.area_id:
+                area = area_reg.async_get_area(entry.area_id)
+                if area:
+                    return area.name
+            # Fall back to device area
+            if entry and entry.device_id:
+                device = dev_reg.async_get(entry.device_id)
+                if device and device.area_id:
+                    area = area_reg.async_get_area(device.area_id)
+                    if area:
+                        return area.name
+
+        # Try device_id
+        if user_input.device_id:
+            device = dev_reg.async_get(user_input.device_id)
+            if device and device.area_id:
+                area = area_reg.async_get_area(device.area_id)
+                if area:
+                    return area.name
+
+        return None
+
+    def _render_prompt(self, prompt: str, user_input: conversation.ConversationInput) -> str:
+        """Replace placeholders in the prompt with actual values."""
+        from datetime import datetime
+
+        now = datetime.now()
+        area = self._resolve_area(user_input) or "ukendt"
+
+        replacements = {
+            "{area_name}": area,
+            "{time}": now.strftime("%H:%M"),
+            "{date}": now.strftime("%d/%m-%Y"),
+            "{language}": user_input.language or "da",
+        }
+        for key, value in replacements.items():
+            prompt = prompt.replace(key, value)
+        return prompt
+
     def _build_messages(
         self,
         history: list[dict[str, Any]],
@@ -123,7 +172,8 @@ class OpenClawConversationEntity(
         history = self._conversations.get(conversation_id, [])
 
         # Add system prompt if first message and configured
-        system_prompt = self.entry.data.get(CONF_PROMPT, "")
+        raw_prompt = self.entry.data.get(CONF_PROMPT, "")
+        system_prompt = self._render_prompt(raw_prompt, user_input) if raw_prompt else ""
         messages: list[dict[str, Any]] = []
         if system_prompt and not history:
             messages.append({"role": "system", "content": system_prompt})
@@ -137,8 +187,8 @@ class OpenClawConversationEntity(
             await chat_log.async_provide_llm_data(
                 user_input.as_llm_context(DOMAIN),
                 None,
-                system_prompt or None,
-                user_input.extra_system_prompt,
+                None,  # Don't pass HA default prompt — we use our own
+                system_prompt or user_input.extra_system_prompt,
             )
         except conversation.ConverseError as err:
             return err.as_conversation_result()
