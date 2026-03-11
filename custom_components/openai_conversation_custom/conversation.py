@@ -86,46 +86,72 @@ class OpenClawConversationEntity(
         timeout = int(data.get(CONF_TIMEOUT, DEFAULT_TIMEOUT))
         return base_url, api_key, model, timeout
 
-    def _resolve_area(self, user_input: conversation.ConversationInput) -> str | None:
-        """Resolve area name from device_id or satellite_id."""
+    def _resolve_device_context(
+        self, user_input: conversation.ConversationInput
+    ) -> dict[str, str]:
+        """Resolve area name, device name, and media player from satellite/device."""
         area_reg = ar.async_get(self.hass)
         dev_reg = dr.async_get(self.hass)
         ent_reg = er.async_get(self.hass)
 
+        area_name: str | None = None
+        device_name: str | None = None
+        media_player: str | None = None
+        device_id: str | None = None
+
         # Try satellite_id first (entity_id of the assist satellite)
         if user_input.satellite_id:
             entry = ent_reg.async_get(user_input.satellite_id)
-            if entry and entry.area_id:
-                area = area_reg.async_get_area(entry.area_id)
-                if area:
-                    return area.name
-            # Fall back to device area
-            if entry and entry.device_id:
-                device = dev_reg.async_get(entry.device_id)
-                if device and device.area_id:
+            if entry:
+                device_id = entry.device_id
+                if entry.area_id:
+                    area = area_reg.async_get_area(entry.area_id)
+                    if area:
+                        area_name = area.name
+                if device_id:
+                    device = dev_reg.async_get(device_id)
+                    if device:
+                        device_name = device.name_by_user or device.name
+                        if not area_name and device.area_id:
+                            area = area_reg.async_get_area(device.area_id)
+                            if area:
+                                area_name = area.name
+
+        # Try device_id as fallback
+        if not device_id and user_input.device_id:
+            device_id = user_input.device_id
+            device = dev_reg.async_get(device_id)
+            if device:
+                device_name = device.name_by_user or device.name
+                if not area_name and device.area_id:
                     area = area_reg.async_get_area(device.area_id)
                     if area:
-                        return area.name
+                        area_name = area.name
 
-        # Try device_id
-        if user_input.device_id:
-            device = dev_reg.async_get(user_input.device_id)
-            if device and device.area_id:
-                area = area_reg.async_get_area(device.area_id)
-                if area:
-                    return area.name
+        # Find media_player entity on the same device
+        if device_id:
+            for entry in er.async_entries_for_device(ent_reg, device_id):
+                if entry.domain == "media_player" and not entry.disabled:
+                    media_player = entry.entity_id
+                    break
 
-        return None
+        return {
+            "area_name": area_name or "ukendt",
+            "device_name": device_name or "ukendt",
+            "media_player": media_player or "ukendt",
+        }
 
     def _render_prompt(self, prompt: str, user_input: conversation.ConversationInput) -> str:
         """Replace placeholders in the prompt with actual values."""
         from datetime import datetime
 
         now = datetime.now()
-        area = self._resolve_area(user_input) or "ukendt"
+        ctx = self._resolve_device_context(user_input)
 
         replacements = {
-            "{area_name}": area,
+            "{area_name}": ctx["area_name"],
+            "{device_name}": ctx["device_name"],
+            "{media_player}": ctx["media_player"],
             "{time}": now.strftime("%H:%M"),
             "{date}": now.strftime("%d/%m-%Y"),
             "{language}": user_input.language or "da",
